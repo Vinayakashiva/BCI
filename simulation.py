@@ -12,7 +12,16 @@ Modes
   Next Trial  : Process one trial manually (step-through)
   Run All     : Process all remaining trials at once
   Demo Mode   : Auto-step through trials with configurable delay
-                Toggle ON/OFF with the Demo Mode button
+
+Display modes
+-------------
+  1. Normal (plots)        : EEG waveform + pipeline badges + charts (original)
+  2. Video playback         : Plays a local .mp4 clip in a fullscreen,
+                               timeline-free "cutscene" player each time a
+                               trial is run. Hold ENTER for 5 seconds to
+                               skip straight to the result.
+  3. Animated illustration  : Professional-styled SVG/HTML neural-signal
+                               animation, stepping through each pipeline stage
 
 Usage
 -----
@@ -25,11 +34,14 @@ Requirements
 """
 
 import time
+import json
+import base64
 import pickle
 from pathlib import Path
 
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.graph_objects as go
 from scipy import signal as sp_signal
 from scipy.io import loadmat
@@ -81,6 +93,10 @@ VAL_DIR      = DATASET_ROOT / "Validation set"
 ARTIFACT_DIR = DATASET_ROOT / "artifacts"
 MODEL_PATH   = ARTIFACT_DIR / "per_subject_models.pkl"
 
+# Local mp4 clip that plays each time a trial is processed in "Video playback"
+# mode. ONE single generic clip is used for every trial — update this path.
+VIDEO_PATH = r"eeg_capture_demo.mp4"
+
 FS              = 256
 TARGET_CHANNELS = 64
 BP_ORDER        = 4
@@ -115,6 +131,21 @@ PIPELINE_STAGES = [
     "Log-variance",
     "SVM classify",
     "Output result",
+]
+
+# Short label + description used by the animated-illustration mode
+# (kept intentionally brief so they fit on-screen during the step animation)
+ANIM_STAGE_INFO = [
+    ("Acquisition",   "64-ch EEG cap samples the scalp at 256 Hz"),
+    ("Artefact check","Peak-to-peak amplitude screened for noise"),
+    ("CAR filter",    "Common average reference removes shared noise"),
+    ("Epoch trim",    "Subject-specific post-stimulus window extracted"),
+    ("Hanning taper", "Edges smoothed to prevent spectral leakage"),
+    ("Band filters",  "Split into theta / mu / beta1 / beta2 / gamma"),
+    ("CSP projection","Spatial filters maximise class separation"),
+    ("Log-variance",  "Band power per component → 20-D feature vector"),
+    ("SVM classify",  "LinearSVC maps features to a decision boundary"),
+    ("Prediction",    "Predicted word and confidence are produced"),
 ]
 
 # Per-stage explanation shown in the methodology report
@@ -209,6 +240,16 @@ COL_DONE    = "#3B6D11"
 COL_WAITING = "#D3D1C7"
 COL_AMBER   = "#BA7517"
 
+# Palette used only by the animated-illustration mode (kept separate so it
+# can be restyled without touching the rest of the app)
+ANIM_INK       = "#1B1B1F"
+ANIM_MUTED     = "#6B6B76"
+ANIM_LINE      = "#D8D8E0"
+ANIM_PANEL     = "#F6F6F9"
+ANIM_ACCENT    = "#4C6FFF"
+ANIM_ACCENT_2  = "#22C3A6"
+ANIM_SUCCESS   = "#1F9D63"
+
 
 # =============================================================================
 # DATA LOADING
@@ -245,6 +286,22 @@ def load_subject_data(subject_key: str):
         return None, None, None
     y_bin = np.where(np.isin(y, list(BILABIAL_LABEL_IDS)), 1, 0).astype(int)
     return X, y, y_bin
+
+
+@st.cache_data
+def load_video_base64(path_str: str):
+    """
+    Load a local mp4 file once, cache it, and return a base64 string so it
+    can be embedded directly as a <video> data URI inside a custom HTML
+    component (needed for the fullscreen, timeline-free "cutscene" player —
+    Streamlit's built-in st.video() cannot hide the scrubber or enter
+    fullscreen programmatically).
+    """
+    p = Path(path_str)
+    if not p.exists():
+        return None
+    with open(p, "rb") as fh:
+        return base64.b64encode(fh.read()).decode("ascii")
 
 
 # =============================================================================
@@ -470,6 +527,402 @@ def result_card_html(pred, true_label, dec_score, word, artefact):
         {art_html}
     </div>
     """
+
+
+# =============================================================================
+# ANIMATED ILLUSTRATION — professional step-by-step neural signal animation
+# =============================================================================
+
+def build_capture_animation_html(word: str, pred_label: int, true_label: int,
+                                  band_powers: dict, height: int = 460) -> str:
+    """
+    A single self-contained HTML/CSS/SVG/JS animation that steps through the
+    real pipeline stages (ANIM_STAGE_INFO) with a professional, minimal
+    design language: a head silhouette with electrodes, a flowing signal
+    line, a stage tracker with a moving progress rail, and a final result
+    reveal card. Auto-plays once on mount (Streamlit re-renders this
+    component fresh every time a trial is processed).
+    """
+    result_color = ANIM_SUCCESS if pred_label == 1 else ANIM_ACCENT
+    correct      = (pred_label == true_label)
+    stages_json  = ANIM_STAGE_INFO
+
+    stage_dots = "".join(
+        f'<div class="stage" id="stage-{i}">'
+        f'<div class="dot"></div>'
+        f'<div class="stage-text"><div class="stage-title">{title}</div>'
+        f'<div class="stage-desc">{desc}</div></div>'
+        f'</div>'
+        for i, (title, desc) in enumerate(stages_json)
+    )
+
+    band_bars = ""
+    if band_powers:
+        vals = list(band_powers.items())
+        vmax = max(abs(v) for _, v in vals) or 1.0
+        for name, v in vals:
+            pct = min(100, max(6, int(abs(v) / vmax * 100)))
+            band_bars += (
+                f'<div class="band-row">'
+                f'<span class="band-label">{name}</span>'
+                f'<div class="band-track"><div class="band-fill" '
+                f'style="width:{pct}%"></div></div>'
+                f'</div>'
+            )
+
+    return f"""
+    <style>
+      .neuro-wrap {{
+        font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+        color: {ANIM_INK};
+        display: grid;
+        grid-template-columns: 230px 1fr 220px;
+        gap: 18px;
+        align-items: start;
+      }}
+      .neuro-card {{
+        background: {ANIM_PANEL};
+        border: 1px solid {ANIM_LINE};
+        border-radius: 14px;
+        padding: 14px 16px;
+      }}
+      .stage {{
+        display: flex; align-items: flex-start; gap: 10px;
+        padding: 7px 4px; border-radius: 8px; opacity: 0.35;
+        transition: opacity 0.35s ease, background 0.35s ease;
+      }}
+      .stage.active {{ opacity: 1; background: rgba(76,111,255,0.08); }}
+      .stage.done   {{ opacity: 0.75; }}
+      .dot {{
+        width: 9px; height: 9px; border-radius: 50%;
+        background: {ANIM_LINE}; margin-top: 5px; flex: none;
+        transition: background 0.3s ease, box-shadow 0.3s ease;
+      }}
+      .stage.active .dot {{
+        background: {ANIM_ACCENT};
+        box-shadow: 0 0 0 4px rgba(76,111,255,0.18);
+      }}
+      .stage.done .dot {{ background: {ANIM_ACCENT_2}; }}
+      .stage-title {{ font-size: 12.5px; font-weight: 600; line-height: 1.3; }}
+      .stage-desc  {{ font-size: 10.5px; color: {ANIM_MUTED}; line-height: 1.35; margin-top: 1px; }}
+
+      .stage-panel-title {{
+        font-size: 11px; font-weight: 700; letter-spacing: 0.06em;
+        text-transform: uppercase; color: {ANIM_MUTED}; margin-bottom: 8px;
+      }}
+
+      .center-panel {{ display:flex; flex-direction:column; align-items:center; gap:10px; }}
+      .flow-caption {{
+        font-size: 12px; color: {ANIM_MUTED}; text-align:center; min-height: 16px;
+      }}
+
+      .band-row {{ display:flex; align-items:center; gap:8px; margin:6px 0; }}
+      .band-label {{ font-size: 10.5px; width: 42px; color:{ANIM_MUTED}; text-transform:capitalize; }}
+      .band-track {{ flex:1; height:7px; background:{ANIM_LINE}; border-radius:4px; overflow:hidden; }}
+      .band-fill {{ height:100%; background:{ANIM_ACCENT}; border-radius:4px;
+                    transition: width 1s ease; }}
+
+      .result-card {{
+        margin-top: 12px; border-radius: 12px; padding: 14px;
+        background: {result_color}14; border: 1px solid {result_color}55;
+        text-align: center; opacity: 0; transform: translateY(6px);
+        transition: opacity 0.5s ease, transform 0.5s ease;
+      }}
+      .result-card.show {{ opacity: 1; transform: translateY(0); }}
+      .result-word {{ font-size: 22px; font-weight: 700; color: {result_color}; }}
+      .result-sub  {{ font-size: 11px; color: {ANIM_MUTED}; margin-top: 2px; }}
+      .result-tag  {{
+        display:inline-block; margin-top:8px; font-size:10.5px; font-weight:600;
+        padding:2px 8px; border-radius:20px;
+        color: {ANIM_SUCCESS if correct else "#B3261E"};
+        background: {ANIM_SUCCESS + "1A" if correct else "#B3261E1A"};
+      }}
+    </style>
+
+    <div class="neuro-wrap">
+
+      <div class="neuro-card">
+        <div class="stage-panel-title">Pipeline</div>
+        {stage_dots}
+      </div>
+
+      <div class="neuro-card center-panel">
+        <div class="stage-panel-title" style="align-self:flex-start">Signal capture</div>
+        <svg viewBox="0 0 320 230" style="width:100%;max-width:320px">
+          <ellipse cx="160" cy="118" rx="86" ry="100" fill="none" stroke="{ANIM_LINE}" stroke-width="2"/>
+          <path d="M 78 82 A 86 100 0 0 1 242 82" fill="none" stroke="{ANIM_LINE}" stroke-width="2"/>
+          <g id="electrodes"></g>
+          <g id="signal-line" opacity="0">
+            <path id="wave-path" d="M 40 200 q 10 -18 20 0 q 10 18 20 0 q 10 -18 20 0 q 10 18 20 0"
+                  fill="none" stroke="{ANIM_ACCENT}" stroke-width="2"/>
+          </g>
+        </svg>
+        <div class="flow-caption" id="flow-caption">Positioning electrodes…</div>
+      </div>
+
+      <div class="neuro-card">
+        <div class="stage-panel-title">Band power</div>
+        <div id="band-container">{band_bars if band_bars else '<div style="font-size:11px;color:' + ANIM_MUTED + '">Computed after CSP…</div>'}</div>
+        <div class="result-card" id="result-card">
+          <div class="result-word" id="result-word">{word}</div>
+          <div class="result-sub">{BINARY_NAMES[pred_label]}</div>
+          <div class="result-tag">{"&#10003; Matches true label" if correct else "&#10007; Differs from true label"}</div>
+        </div>
+      </div>
+
+    </div>
+
+    <script>
+    (function() {{
+      const stages = {json.dumps([{"t": t, "d": d} for t, d in stages_json])};
+      const positions = [[160,44],[196,50],[124,50],[220,68],[100,68],
+                          [232,96],[88,96],[220,128],[100,128],[160,150]];
+      const eg = document.getElementById('electrodes');
+      positions.forEach((p,i)=>{{
+        const c = document.createElementNS("http://www.w3.org/2000/svg","circle");
+        c.setAttribute("cx",p[0]); c.setAttribute("cy",p[1]); c.setAttribute("r",5.5);
+        c.setAttribute("fill","#FFFFFF"); c.setAttribute("stroke","{ANIM_LINE}");
+        c.setAttribute("stroke-width","2"); c.setAttribute("id","e"+i);
+        eg.appendChild(c);
+      }});
+
+      const STEP_MS = 480;
+      let i = 0;
+
+      function setStage(idx) {{
+        for (let k=0; k<10; k++) {{
+          const el = document.getElementById('stage-'+k);
+          if (!el) continue;
+          el.classList.remove('active');
+          if (k < idx) el.classList.add('done'); else el.classList.remove('done');
+          if (k === idx) el.classList.add('active');
+        }}
+        const capt = document.getElementById('flow-caption');
+        if (stages[idx]) capt.textContent = stages[idx].d;
+      }}
+
+      function tick() {{
+        if (i >= 10) return;
+        setStage(i);
+
+        if (i === 0) {{
+          positions.forEach((p, k) => {{
+            setTimeout(() => {{
+              const el = document.getElementById('e'+k);
+              el.setAttribute("fill", "{ANIM_ACCENT}");
+              setTimeout(() => el.setAttribute("fill", "#FFFFFF"), 200);
+            }}, k * 35);
+          }});
+        }}
+        if (i === 5) {{
+          document.getElementById('signal-line').setAttribute('opacity', '1');
+        }}
+        if (i === 9) {{
+          setTimeout(() => {{
+            document.getElementById('result-card').classList.add('show');
+          }}, 150);
+        }}
+
+        i += 1;
+        setTimeout(tick, STEP_MS);
+      }}
+      tick();
+    }})();
+    </script>
+    """
+
+
+# =============================================================================
+# VIDEO PLAYBACK -- fullscreen, timeline-free "cutscene" player
+# =============================================================================
+
+def build_video_capture_html(video_b64: str, mime: str = "video/mp4",
+                              nonce: str = "0") -> str:
+    """
+    Custom HTML5 video player (replaces st.video()) that:
+      - Has NO native controls, so no seek bar / timeline is ever visible
+      - Auto-plays muted (browser autoplay policy requires this without a
+        prior user gesture)
+      - Fills the ENTIRE browser viewport as a "cutscene" -- this does NOT
+        use the real Fullscreen API, because Streamlit's components.html
+        iframe is not marked allow="fullscreen" and the browser silently
+        blocks requestFullscreen() inside it (a known Streamlit platform
+        limitation). Instead, this script reaches into the parent page
+        (window.parent.document -- same-origin, so this is allowed) and
+        injects a fixed, full-viewport black overlay containing the video,
+        covering the sidebar/buttons/everything -- visually identical to a
+        game cutscene without depending on a browser permission that
+        Streamlit blocks.
+      - Lets the user hold ENTER for 5 seconds to skip: a thin progress bar
+        fills at the bottom while held, and on completion the overlay is
+        removed, instantly revealing the result already rendered on the
+        underlying Streamlit page.
+      - Also auto-removes the overlay when the clip finishes naturally.
+
+    `nonce` should change on every trial (e.g. the trial index) so the
+    component re-mounts and restarts playback instead of Streamlit re-using
+    a cached iframe.
+    """
+    if not video_b64:
+        return (
+            '<div style="padding:2rem;text-align:center;'
+            'font-family:sans-serif;color:#B3261E;'
+            'border:1px dashed #E5B3AE;border-radius:10px">'
+            'Video file not found. Update VIDEO_PATH at the top of the script.'
+            '</div>'
+        )
+
+    return f"""
+    <div id="cutscene-status-{nonce}" style="
+        padding:10px 14px; font-family:-apple-system,'Segoe UI',Roboto,sans-serif;
+        font-size:12px; color:#6B6B76; background:#F6F6F9; border-radius:8px;">
+      Playing capture video in fullscreen&hellip; hold <strong>ENTER</strong> for 5s to skip.
+    </div>
+
+    <script>
+    (function() {{
+      const nonce = "{nonce}";
+      const videoSrc = "data:{mime};base64,{video_b64}";
+
+      let pdoc, pwin;
+      try {{
+        pdoc = window.parent.document;
+        pwin = window.parent;
+      }} catch (e) {{
+        pdoc = document;
+        pwin = window;
+      }}
+
+      // Clean up any previous cutscene overlay + listeners from an earlier
+      // trial before creating a new one, so they don't stack up.
+      const prevOverlay = pdoc.getElementById('bci-cutscene-overlay');
+      if (prevOverlay) prevOverlay.remove();
+      if (pwin.__bciCutsceneCleanup) {{
+        try {{ pwin.__bciCutsceneCleanup(); }} catch (e) {{}}
+      }}
+
+      // ---- Build the full-viewport overlay in the PARENT document ----
+      const overlay = pdoc.createElement('div');
+      overlay.id = 'bci-cutscene-overlay';
+      overlay.tabIndex = -1;
+      overlay.style.cssText = [
+        'position:fixed', 'top:0', 'left:0', 'width:100vw', 'height:100vh',
+        'background:#000', 'z-index:2147483647', 'display:flex',
+        'align-items:center', 'justify-content:center', 'flex-direction:column',
+        'outline:none',
+      ].join(';');
+
+      const video = pdoc.createElement('video');
+      video.src = videoSrc;
+      video.muted = true;
+      video.autoplay = true;
+      video.playsInline = true;
+      video.disablePictureInPicture = true;
+      video.style.cssText = 'width:100%;height:100%;object-fit:contain;background:#000;';
+      video.oncontextmenu = function() {{ return false; }};
+
+      const hint = pdoc.createElement('div');
+      hint.style.cssText = [
+        'position:absolute', 'left:0', 'right:0', 'bottom:0', 'padding:16px 24px',
+        'background:linear-gradient(transparent, rgba(0,0,0,0.7))',
+        "font-family:-apple-system,'Segoe UI',Roboto,sans-serif",
+        'color:#fff', 'font-size:13px', 'display:flex', 'flex-direction:column', 'gap:8px',
+      ].join(';');
+      hint.innerHTML =
+        '<span>Hold <strong>ENTER</strong> for 5 seconds to skip</span>' +
+        '<div style="height:5px;width:100%;background:rgba(255,255,255,0.25);' +
+        'border-radius:3px;overflow:hidden;">' +
+        '<div id="bci-skip-bar" style="height:100%;width:0%;background:#4C6FFF;' +
+        'border-radius:3px;"></div></div>';
+
+      overlay.appendChild(video);
+      overlay.appendChild(hint);
+      pdoc.body.appendChild(overlay);
+
+      // The "Next Trial" button (or whatever was clicked to get here) still
+      // holds keyboard focus at this point. On most browsers, pressing
+      // ENTER while a <button> is focused re-clicks that button instead of
+      // reaching our listener -- which is exactly why skip silently did
+      // nothing. Move focus onto the overlay itself so ENTER has nothing
+      // else to activate.
+      if (pdoc.activeElement && typeof pdoc.activeElement.blur === 'function') {{
+        pdoc.activeElement.blur();
+      }}
+      overlay.focus();
+
+      const skipBar = hint.querySelector('#bci-skip-bar');
+
+      function removeOverlay() {{
+        video.pause();
+        if (overlay.parentNode) overlay.remove();
+        cleanup();
+      }}
+
+      // ---- Hold-ENTER-for-5s-to-skip ----
+      let holdStart = null;
+      let rafId = null;
+
+      function tickHold() {{
+        if (holdStart === null) return;
+        const elapsed = Date.now() - holdStart;
+        const pct = Math.min(100, (elapsed / 5000) * 100);
+        if (skipBar) skipBar.style.width = pct + '%';
+        if (elapsed >= 5000) {{
+          holdStart = null;
+          removeOverlay();
+          return;
+        }}
+        rafId = pwin.requestAnimationFrame(tickHold);
+      }}
+
+      function onKeyDown(e) {{
+        if (e.key !== 'Enter') return;
+        // Stop the browser from treating this as "activate the focused
+        // button" and stop it from reaching any other page-level handler.
+        e.preventDefault();
+        e.stopPropagation();
+        if (holdStart === null) {{
+          holdStart = Date.now();
+          tickHold();
+        }}
+      }}
+      function onKeyUp(e) {{
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        e.stopPropagation();
+        holdStart = null;
+        if (skipBar) skipBar.style.width = '0%';
+        if (rafId) pwin.cancelAnimationFrame(rafId);
+      }}
+      function onEnded() {{ removeOverlay(); }}
+
+      // Capture phase + listen on both document AND window so the ENTER
+      // press is intercepted before it can reach the focused button or any
+      // other page-level shortcut handler.
+      pdoc.addEventListener('keydown', onKeyDown, true);
+      pdoc.addEventListener('keyup', onKeyUp, true);
+      pwin.addEventListener('keydown', onKeyDown, true);
+      pwin.addEventListener('keyup', onKeyUp, true);
+      video.addEventListener('ended', onEnded);
+
+      function cleanup() {{
+        pdoc.removeEventListener('keydown', onKeyDown, true);
+        pdoc.removeEventListener('keyup', onKeyUp, true);
+        pwin.removeEventListener('keydown', onKeyDown, true);
+        pwin.removeEventListener('keyup', onKeyUp, true);
+        pwin.__bciCutsceneCleanup = null;
+      }}
+      pwin.__bciCutsceneCleanup = cleanup;
+
+      video.play().catch(function() {{
+        // Autoplay blocked even muted (rare) -- let the user click the video.
+        video.addEventListener('click', function() {{ video.play(); }}, {{ once: true }});
+      }});
+    }})();
+    </script>
+    """
+
+
 
 
 # =============================================================================
@@ -728,6 +1181,18 @@ def main():
             )
 
         st.divider()
+        st.markdown("### Display mode")
+        display_mode = st.radio(
+            "Choose how a trial is visualised",
+            [
+                "1. Normal (plots)",
+                "2. Video playback",
+                "3. Animated illustration",
+            ],
+            index=0,
+        )
+
+        st.divider()
         st.markdown("### Optional displays")
         show_eeg      = st.checkbox("EEG waveform",        value=True)
         show_pipeline = st.checkbox("Pipeline stages",     value=True)
@@ -800,56 +1265,126 @@ def main():
     st.divider()
 
     # ── Main layout ───────────────────────────────────────────────────────────
-    left, right = st.columns([3, 2], gap="large")
+    is_normal = display_mode.startswith("1")
+    is_video  = display_mode.startswith("2")
+    is_anim   = display_mode.startswith("3")
+
+    eeg_ph  = pipe_ph = band_ph = acc_ph = None
+    video_ph = anim_ph = None
+
+    if is_normal:
+        left, right = st.columns([3, 2], gap="large")
+    elif is_video:
+        left, right = st.columns([3, 2], gap="large")
+    else:
+        left, right = st.columns([1, 1], gap="large")  # animation needs more room
 
     with left:
-        eeg_ph  = st.empty()
-        pipe_ph = st.empty()
-        band_ph = st.empty()
-        acc_ph  = st.empty()
+        if is_normal:
+            eeg_ph  = st.empty()
+            pipe_ph = st.empty()
+            band_ph = st.empty()
+            acc_ph  = st.empty()
 
-        if show_eeg:
-            if st.session_state.last_eeg is not None:
-                eeg_ph.plotly_chart(
-                    eeg_plot(
-                        st.session_state.last_eeg,
-                        title=(f"EEG — {subject} · trial {idx} · "
-                               f"{st.session_state.last_word}"),
-                        epoch_start=model["epoch_start"],
-                        epoch_end=model["epoch_end"],
-                    ),
+            if show_eeg:
+                if st.session_state.last_eeg is not None:
+                    eeg_ph.plotly_chart(
+                        eeg_plot(
+                            st.session_state.last_eeg,
+                            title=(f"EEG — {subject} · trial {idx} · "
+                                   f"{st.session_state.last_word}"),
+                            epoch_start=model["epoch_start"],
+                            epoch_end=model["epoch_end"],
+                        ),
+                        use_container_width=True,
+                        config={"displayModeBar": False},
+                    )
+                else:
+                    eeg_ph.info("EEG will appear after the first trial.")
+
+            if show_pipeline:
+                st.markdown("**Pipeline stages:**")
+                pipe_ph.markdown(
+                    pipeline_html(st.session_state.stage_idx),
+                    unsafe_allow_html=True,
+                )
+
+            if show_bands and st.session_state.last_band_powers:
+                band_ph.plotly_chart(
+                    band_power_plot(st.session_state.last_band_powers,
+                                    st.session_state.last_pred or 0),
                     use_container_width=True,
                     config={"displayModeBar": False},
                 )
+
+            if show_acc and history:
+                acc_ph.plotly_chart(
+                    accuracy_plot(history),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                )
+
+        elif is_video:
+            video_ph = st.empty()
+            if st.session_state.last_pred is not None:
+                video_b64 = load_video_base64(str(VIDEO_PATH))
+                if video_b64 is None:
+                    video_ph.error(
+                        f"Video file not found at `{VIDEO_PATH}`. "
+                        "Update VIDEO_PATH at the top of this script to "
+                        "point at your .mp4 file."
+                    )
+                else:
+                    with video_ph:
+                        components.html(
+                            build_video_capture_html(
+                                video_b64, nonce=str(idx)
+                            ),
+                            height=60,
+                            scrolling=False,
+                        )
+                    st.caption(
+                        f"Trial {idx} · predicted word: "
+                        f"**{st.session_state.last_word}** · "
+                        "hold ENTER 5s to skip to the result"
+                    )
             else:
-                eeg_ph.info("EEG will appear after the first trial.")
+                video_ph.info("Click Next Trial to play the capture video.")
 
-        if show_pipeline:
-            st.markdown("**Pipeline stages:**")
-            pipe_ph.markdown(
-                pipeline_html(st.session_state.stage_idx),
-                unsafe_allow_html=True,
-            )
+        else:  # animated illustration — spans full width below
+            pass
 
-        if show_bands and st.session_state.last_band_powers:
-            band_ph.plotly_chart(
-                band_power_plot(st.session_state.last_band_powers,
-                                st.session_state.last_pred or 0),
-                use_container_width=True,
-                config={"displayModeBar": False},
+    if is_anim:
+        anim_ph = st.empty()
+        if st.session_state.last_pred is not None:
+            html = build_capture_animation_html(
+                word=st.session_state.last_word,
+                pred_label=st.session_state.last_pred,
+                true_label=st.session_state.last_true,
+                band_powers=st.session_state.last_band_powers,
             )
-
-        if show_acc and history:
-            acc_ph.plotly_chart(
-                accuracy_plot(history),
-                use_container_width=True,
-                config={"displayModeBar": False},
-            )
+            with anim_ph:
+                components.html(html, height=430, scrolling=False)
+        else:
+            anim_ph.info("Click Next Trial to run the animation.")
 
     with right:
         st.markdown("**Result**")
         result_ph = st.empty()
-        if st.session_state.last_pred is not None:
+        if st.session_state.last_pred is not None and not is_anim:
+            # Animated illustration mode already shows its own result card,
+            # so avoid duplicating it here.
+            result_ph.markdown(
+                result_card_html(
+                    st.session_state.last_pred,
+                    st.session_state.last_true,
+                    st.session_state.last_score,
+                    st.session_state.last_word,
+                    st.session_state.artefact,
+                ),
+                unsafe_allow_html=True,
+            )
+        elif is_anim and st.session_state.last_pred is not None:
             result_ph.markdown(
                 result_card_html(
                     st.session_state.last_pred,
@@ -922,7 +1457,7 @@ def main():
         true_bin = int(y_bin[ci])
         trial_X  = X_val[ci:ci+1]
 
-        if animate and show_pipeline:
+        if animate and is_normal and show_pipeline and pipe_ph is not None:
             for si in range(len(PIPELINE_STAGES)):
                 pipe_ph.markdown(pipeline_html(si), unsafe_allow_html=True)
                 time.sleep(0.08)
@@ -944,22 +1479,43 @@ def main():
 
     # Demo Mode — auto-step
     if st.session_state.demo_running and idx < n_trials:
-        process_one(idx, animate=show_pipeline)
+        process_one(idx, animate=(is_normal and show_pipeline))
 
-        # Refresh EEG and result live
-        if show_eeg and st.session_state.last_eeg is not None:
-            eeg_ph.plotly_chart(
-                eeg_plot(
-                    st.session_state.last_eeg,
-                    title=(f"EEG — {subject} · "
-                           f"trial {st.session_state.idx} · "
-                           f"{st.session_state.last_word}"),
-                    epoch_start=model["epoch_start"],
-                    epoch_end=model["epoch_end"],
-                ),
-                use_container_width=True,
-                config={"displayModeBar": False},
+        # Refresh live displays for the current display mode
+        if is_normal:
+            if show_eeg and st.session_state.last_eeg is not None and eeg_ph is not None:
+                eeg_ph.plotly_chart(
+                    eeg_plot(
+                        st.session_state.last_eeg,
+                        title=(f"EEG — {subject} · "
+                               f"trial {st.session_state.idx} · "
+                               f"{st.session_state.last_word}"),
+                        epoch_start=model["epoch_start"],
+                        epoch_end=model["epoch_end"],
+                    ),
+                    use_container_width=True,
+                    config={"displayModeBar": False},
+                )
+        elif is_video and video_ph is not None:
+            video_b64 = load_video_base64(str(VIDEO_PATH))
+            if video_b64 is not None:
+                with video_ph:
+                    components.html(
+                        build_video_capture_html(
+                            video_b64, nonce=str(st.session_state.idx)
+                        ),
+                        height=60,
+                        scrolling=False,
+                    )
+        elif is_anim and anim_ph is not None:
+            html = build_capture_animation_html(
+                word=st.session_state.last_word,
+                pred_label=st.session_state.last_pred,
+                true_label=st.session_state.last_true,
+                band_powers=st.session_state.last_band_powers,
             )
+            with anim_ph:
+                components.html(html, height=430, scrolling=False)
 
         result_ph.markdown(
             result_card_html(
