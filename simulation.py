@@ -1478,7 +1478,7 @@ def main():
         record_trial(ci, pred, dec, eeg, art, bp, word, true_bin)
 
         # ==========================
-        # AI ENGINE
+        # AI ENGINE IMPLEMENTATION
         # ==========================
 
         confidence = min(99, max(51, 50 + abs(dec) * 15)) / 100.0
