@@ -934,6 +934,7 @@ STATE_KEYS = [
     "idx", "history", "last_pred", "last_score", "last_true",
     "last_word", "last_eeg", "stage_idx", "artefact",
     "last_band_powers", "demo_running",
+    "generated_sentence", "generated_audio", "ai_confidence",
 ]
 
 def reset_state():
@@ -952,6 +953,9 @@ def set_defaults():
     st.session_state.setdefault("artefact",        False)
     st.session_state.setdefault("last_band_powers",{})
     st.session_state.setdefault("demo_running",    False)
+    st.session_state.setdefault("generated_sentence", "")
+    st.session_state.setdefault("generated_audio",    None)
+    st.session_state.setdefault("ai_confidence",      0.0)
 
 def record_trial(ci, pred, dec, eeg, art, bp, word, true_bin):
     correct  = (pred == true_bin)
@@ -970,7 +974,6 @@ def record_trial(ci, pred, dec, eeg, art, bp, word, true_bin):
     st.session_state.last_band_powers = bp
     st.session_state.stage_idx        = len(PIPELINE_STAGES) - 1
     st.session_state.artefact         = art
-    st.session_state.idx              = ci + 1
 
 
 # =============================================================================
@@ -1386,12 +1389,18 @@ def main():
                 unsafe_allow_html=True,
             )
 
-            if "generated_sentence" in st.session_state:
+            if (
+                    "generated_sentence" in st.session_state
+                    and "generated_audio" in st.session_state
+            ):
                 st.markdown("### 🧠 AI Engine Output")
 
                 st.success(st.session_state.generated_sentence)
 
-                st.audio("output.wav", format="audio/wav")
+                st.audio(
+                    st.session_state.generated_audio,
+                    format="audio/mp3"
+                )
         elif is_anim and st.session_state.last_pred is not None:
             result_ph.markdown(
                 result_card_html(
@@ -1460,7 +1469,8 @@ def main():
         st.session_state.demo_running = not st.session_state.demo_running
         st.rerun()
 
-    def process_one(ci, animate=True,generate_audio=True):
+    def process_one(ci, animate=True, generate_audio=True):
+        """Process exactly one EEG trial without changing the global index."""
         word = CLASS_NAMES.get(int(y_raw[ci]), "?")
         true_bin = int(y_bin[ci])
         trial_X = X_val[ci:ci + 1]
@@ -1480,13 +1490,11 @@ def main():
         # ==========================
         # AI ENGINE
         # ==========================
-
         confidence = min(99, max(51, 50 + abs(dec) * 15)) / 100.0
 
-        # Optional speech imagery stage
         imagined_word = generate_speech_imagery(
             word,
-            verbose=generate_audio
+            verbose=False
         )
 
         sentence = process_prediction(
@@ -1498,22 +1506,44 @@ def main():
         st.session_state.generated_sentence = sentence
         st.session_state.ai_confidence = confidence
 
-        # Generate WAV using pyttsx3
+        # Generate a unique WAV for this trial
         if generate_audio:
-            text_to_wav(sentence)
-            st.session_state.generated_audio = "output.wav"
+            audio_file = BASE_DIR / f"output_trial_{ci + 1}.mp3"
+            text_to_wav(sentence, str(audio_file))
+            st.session_state.generated_audio = str(audio_file)
+
+        return sentence
 
 
-    # Next Trial
+    # Next Trial — process exactly one sample
     if next_btn and idx < n_trials:
-        process_one(idx, animate=True,generate_audio=True)
+        process_one(idx, animate=True, generate_audio=True)
+        st.session_state.idx = idx + 1
         st.rerun()
 
-    # Run All
+    # Run All — process every remaining sample exactly once
     if run_all_btn and idx < n_trials:
-        with st.spinner(f"Processing {n_trials - idx} trials..."):
-            for i in range(idx, n_trials):
-                process_one(i, animate=False,generate_audio=False)
+        start_idx = int(st.session_state.idx)
+        remaining = n_trials - start_idx
+
+        with st.spinner(
+            f"Processing all {remaining} remaining trials "
+            f"({start_idx + 1}–{n_trials})..."
+        ):
+            for i in range(start_idx, n_trials):
+                process_one(
+                    i,
+                    animate=False,
+                    generate_audio=True
+                )
+
+                # Advance only after that trial has completed
+                st.session_state.idx = i + 1
+
+        # Force the UI to show 50/50 and prevent the Run All button
+        # from starting the same run again. This is one controlled rerun.
+        st.session_state.idx = n_trials
+        st.session_state.demo_running = False
         st.rerun()
 
     # Demo Mode — auto-step
@@ -1576,7 +1606,7 @@ def main():
 
             st.audio(
                 st.session_state.generated_audio,
-                format="audio/wav"
+                format="audio/mp3"
             )
 
         time.sleep(demo_delay)
