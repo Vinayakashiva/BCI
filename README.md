@@ -13,57 +13,37 @@ Built on the [BCI2020 EEG Signal for Words](https://www.kaggle.com/datasets/kyle
 imagined-speech dataset (15 subjects, 5 words, 64-channel EEG, 256 Hz).
 
 ---
+```mermaid
+flowchart TD
 
-## How it works
+    A["Raw EEG Trial<br/>64 Channels × Time"]
 
-Both the authenticator and the word decoder share the same signal-processing
-front end, then diverge:
+    A --> B["CAR<br/>Common Average Reference"]
+    B --> C["Epoch Trim<br/>Post-Stimulus Window"]
+    C --> D["Hanning Taper<br/>Anti-Leakage Window"]
+    D --> E["Bandpass Filtering × 5<br/>Theta • Mu • Beta1 • Beta2 • Gamma"]
 
-Raw EEG Trial (64 Channels × Time)
-            │
-            ▼
- Common Average Reference (CAR)
-            │
-            ▼
- Epoch Trim (Post-Stimulus Window)
-            │
-            ▼
- Hanning Taper
-            │
-            ▼
- Bandpass Filtering × 5
- (Theta, Mu, Beta1, Beta2, Gamma)
-            │
-     ┌──────┴──────┐
-     ▼             ▼
+    E --> F["Authentication"]
+    E --> G["Word Decoding"]
 
-AUTHENTICATION   WORD DECODING
-     │             │
-Per-Channel      CSP
-Log Band-Power   (4 Components/Band)
-+ Broadband      │
-Log-Variance     ▼
-     │        Log-Variance
-     ▼        (20 Features)
-One-vs-Rest       │
-LinearSVC         ▼
-     │       StandardScaler
-     ▼             │
-Subject Score      ▼
-     │         LinearSVC
-     ▼             │
-EER Threshold      ▼
-     │      Bilabial /
-     ▼      Non-Bilabial
- Authentication
-     │
- ┌───┴───┐
- ▼       ▼
+    F --> F1["Per-Channel Log Band-Power<br/>+ Broadband Log-Variance"]
+    F1 --> F2["One-vs-Rest LinearSVC"]
+    F2 --> F3["Score vs Enrolled Subjects"]
+    F3 --> F4["Threshold Tuning via EER"]
 
-GRANTED  DENIED
-   │        │
-Unlock   Word Prediction
-Simulator   Locked
+    F4 --> H{"Authentication Result"}
+
+    H -->|Granted| I["Unlock Simulator"]
+    H -->|Denied| J["Access Locked"]
+
+    G --> G1["Per-Subject CSP<br/>4 Components per Band"]
+    G1 --> G2["Log-Variance Features<br/>20 Features"]
+    G2 --> G3["StandardScaler"]
+    G3 --> G4["LinearSVC"]
+    G4 --> G5["Bilabial / Non-Bilabial Prediction"]
+
+    J --> K["Word Prediction Locked"]
+```
 
 The authentication threshold is tuned automatically during enrollment by
 computing genuine-vs-imposter scores on the validation split and finding the
