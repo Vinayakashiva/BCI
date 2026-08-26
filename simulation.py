@@ -30,6 +30,9 @@ Usage
 Requirements
 ------------
     pip install streamlit plotly scipy numpy scikit-learn
+
+    Optional (for "Voice output" — imagined word -> sentence -> speech):
+    pip install edge-tts anthropic
 =============================================================================
 """
 
@@ -37,7 +40,11 @@ import time
 import json
 import base64
 import pickle
+import asyncio
+import io
+import os
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import streamlit as st
@@ -46,6 +53,58 @@ import plotly.graph_objects as go
 from scipy import signal as sp_signal
 from scipy.io import loadmat
 from sklearn.metrics import balanced_accuracy_score
+
+# Optional deps for the "imagined word -> sentence -> voice" feature.
+# The app still runs fine without them (falls back to canned sentences /
+# no audio), so these are soft imports rather than hard requirements.
+try:
+    import edge_tts
+    EDGE_TTS_AVAILABLE = True
+except ImportError:
+    EDGE_TTS_AVAILABLE = False
+
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+
+# EEG authentication gate (authentication.py must sit next to this file).
+# Soft import: if it's missing, the app still runs — the login gate simply
+# reports that it can't find the module instead of crashing the whole app.
+try:
+    from authentication import (
+        AUTH_DIR,
+        SUBJECT_MODEL_PATH,
+        WORD_MODEL_PATH,
+        EER_PATH,
+        discover_dataset as auth_discover_dataset,
+        discover_mat_files as auth_discover_mat_files,
+        load_epoch as auth_load_epoch,
+        extract_subject_features,
+        SubjectAuthenticator,
+        WordPredictor,
+    )
+    AUTH_MODULE_AVAILABLE = True
+
+    # --- pickle compatibility shim -----------------------------------------
+    # If auth_artifacts/*.pkl were created by running `python authentication.py
+    # ...` directly, SubjectAuthenticator/WordPredictor were pickled as
+    # belonging to "__main__" (whatever script was run at the time), not to
+    # "authentication". When THIS script — a different __main__ — later tries
+    # to unpickle them, Python looks for those classes on its own __main__ and
+    # raises AttributeError. Registering them here makes both old-style
+    # (__main__-pickled) and new-style (module-pickled) artifacts load fine,
+    # regardless of how enroll/self-test was invoked.
+    import sys as _sys
+    _main_mod = _sys.modules.get("__main__")
+    if _main_mod is not None:
+        if not hasattr(_main_mod, "SubjectAuthenticator"):
+            _main_mod.SubjectAuthenticator = SubjectAuthenticator
+        if not hasattr(_main_mod, "WordPredictor"):
+            _main_mod.WordPredictor = WordPredictor
+except ImportError:
+    AUTH_MODULE_AVAILABLE = False
 
 
 # =============================================================================
@@ -534,195 +593,295 @@ def result_card_html(pred, true_label, dec_score, word, artefact):
 # =============================================================================
 
 def build_capture_animation_html(word: str, pred_label: int, true_label: int,
-                                  band_powers: dict, height: int = 460) -> str:
+                                  band_powers: dict, dec_score: float = 0.0,
+                                  height: int = 460) -> str:
     """
-    A single self-contained HTML/CSS/SVG/JS animation that steps through the
-    real pipeline stages (ANIM_STAGE_INFO) with a professional, minimal
-    design language: a head silhouette with electrodes, a flowing signal
-    line, a stage tracker with a moving progress rail, and a final result
-    reveal card. Auto-plays once on mount (Streamlit re-renders this
-    component fresh every time a trial is processed).
-    """
-    result_color = ANIM_SUCCESS if pred_label == 1 else ANIM_ACCENT
-    correct      = (pred_label == true_label)
-    stages_json  = ANIM_STAGE_INFO
+    Sankey-style "signal flow" illustration in the spirit of the transformer-
+    explainer visualisation: EEG channel tokens fan out into colour-coded
+    ribbons (CAR / Bandpass / CSP-variance — echoing Key/Query/Value lanes),
+    converge on a CSP "attention-like" component grid, flow through an SVM
+    funnel, and resolve into a probability panel on the right, exactly the
+    way the reference diagram ends in a ranked token-probability list.
 
-    stage_dots = "".join(
-        f'<div class="stage" id="stage-{i}">'
-        f'<div class="dot"></div>'
-        f'<div class="stage-text"><div class="stage-title">{title}</div>'
-        f'<div class="stage-desc">{desc}</div></div>'
-        f'</div>'
-        for i, (title, desc) in enumerate(stages_json)
+    The whole thing steps through the real pipeline stages (ANIM_STAGE_INFO):
+    channels pulse first, then each ribbon lights up in turn, then the CSP
+    grid, then the SVM funnel, then the prediction panel fades in — so it
+    reads as an actual animation rather than a static picture.
+
+    The SVG's rendered width is capped (not left at 100% of the Streamlit
+    column) so its height can never grow past the fixed iframe height the
+    caller allocates, regardless of how wide the page layout is.
+    """
+    correct       = (pred_label == true_label)
+    result_color  = ANIM_SUCCESS if pred_label == 1 else ANIM_ACCENT
+    conf          = min(99, max(51, 50 + abs(dec_score) * 15))
+    other_pct     = 100 - conf
+    pred_name     = BINARY_NAMES[pred_label]
+    other_name    = BINARY_NAMES[1 - pred_label]
+
+    KEY_COL, QUERY_COL, VALUE_COL = "#E2574C", ANIM_ACCENT, ANIM_ACCENT_2
+
+    CH_X, CH_Y0, CH_STEP = 55, 38, 34
+    KQV_X                = 250
+    KEY_Y, QUERY_Y, VALUE_Y = 82, 176, 270
+    GRID_X0, GRID_X1     = 380, 570
+    GRID_Y0, GRID_Y1     = 92, 262
+    OUT_X, OUT_Y         = 630, 176
+    SVM_X0, SVM_X1       = 670, 830
+    FINAL_X              = 862
+
+    bands    = list(FREQ_BANDS.keys())
+    vals     = [abs(band_powers.get(b, 0.0)) for b in bands]
+    vmax     = max(vals) or 1.0
+    col_norm = [v / vmax for v in vals]
+    top_band_idx = col_norm.index(max(col_norm)) if col_norm else 0
+
+    ch_ys = [CH_Y0 + i * CH_STEP for i in range(len(DISPLAY_CH_NAMES))]
+
+    def curve(x0, y0, x1, y1):
+        mx = (x0 + x1) / 2
+        return f"M {x0} {y0} C {mx} {y0}, {mx} {y1}, {x1} {y1}"
+
+    ribbons_in, ch_dots = [], []
+    for name, y in zip(DISPLAY_CH_NAMES, ch_ys):
+        ribbons_in.append(
+            f'<text x="{CH_X-12}" y="{y+4}" text-anchor="end" font-size="10.5" '
+            f'fill="{ANIM_MUTED}">{name}</text>'
+        )
+        ch_dots.append(
+            f'<circle class="ch-dot" cx="{CH_X}" cy="{y}" r="3" fill="{ANIM_INK}" opacity="0.5"/>'
+        )
+        for ty, col, lane in ((KEY_Y, KEY_COL, "car"), (QUERY_Y, QUERY_COL, "bandpass"),
+                               (VALUE_Y, VALUE_COL, "cspvar")):
+            ribbons_in.append(
+                f'<path d="{curve(CH_X, y, KQV_X, ty)}" stroke="{col}" '
+                f'stroke-width="1.2" fill="none" opacity="0.15" class="ribbon lane-{lane}"/>'
+            )
+
+    grid_dots = []
+    for c in range(5):
+        gx = GRID_X0 + 30 + c * 34
+        for r in range(4):
+            gy = GRID_Y0 + 20 + r * 40
+            inten = col_norm[c] * (1 - r * 0.15)
+            fill  = f"rgba(76,111,255,{0.15 + inten * 0.7:.2f})"
+            hi    = ' class="grid-dot grid-dot-top"' if c == top_band_idx else ' class="grid-dot"'
+            grid_dots.append(f'<circle{hi} cx="{gx}" cy="{gy}" r="7" fill="{fill}"/>')
+
+    band_labels = "".join(
+        f'<text x="{GRID_X0+30+c*34}" y="{GRID_Y1+18}" text-anchor="middle" '
+        f'font-size="9" fill="{ANIM_MUTED}">{bands[c]}</text>'
+        for c in range(5)
     )
 
-    band_bars = ""
-    if band_powers:
-        vals = list(band_powers.items())
-        vmax = max(abs(v) for _, v in vals) or 1.0
-        for name, v in vals:
-            pct = min(100, max(6, int(abs(v) / vmax * 100)))
-            band_bars += (
-                f'<div class="band-row">'
-                f'<span class="band-label">{name}</span>'
-                f'<div class="band-track"><div class="band-fill" '
-                f'style="width:{pct}%"></div></div>'
-                f'</div>'
-            )
+    key_to_grid   = curve(KQV_X, KEY_Y, GRID_X0, (GRID_Y0 + GRID_Y1) // 2)
+    query_to_grid = curve(KQV_X, QUERY_Y, GRID_X0, (GRID_Y0 + GRID_Y1) // 2)
+    value_to_out  = (
+        f"M {KQV_X} {VALUE_Y} C {(KQV_X+OUT_X)//2} {VALUE_Y}, "
+        f"{(KQV_X+OUT_X)//2} {OUT_Y+60}, {OUT_X} {OUT_Y}"
+    )
+    grid_to_out   = curve(GRID_X1, (GRID_Y0 + GRID_Y1) // 2, OUT_X, OUT_Y)
+    out_to_svm    = curve(OUT_X, OUT_Y, SVM_X0, OUT_Y)
+    svm_mid       = (SVM_X0 + SVM_X1) // 2
+    svm_shape     = (
+        f"M {SVM_X0} {OUT_Y-60} C {svm_mid} {OUT_Y-60}, {svm_mid} {OUT_Y}, {svm_mid} {OUT_Y} "
+        f"C {svm_mid} {OUT_Y}, {svm_mid} {OUT_Y+60}, {SVM_X0} {OUT_Y+60} "
+        f"M {SVM_X1} {OUT_Y-60} C {svm_mid} {OUT_Y-60}, {svm_mid} {OUT_Y}, {svm_mid} {OUT_Y} "
+        f"C {svm_mid} {OUT_Y}, {svm_mid} {OUT_Y+60}, {SVM_X1} {OUT_Y+60}"
+    )
+    svm_to_final  = curve(SVM_X1, OUT_Y, FINAL_X, OUT_Y)
+
+    svg = f"""
+    <svg viewBox="0 0 900 340" style="width:100%;height:auto;display:block">
+      <text x="{CH_X}" y="16" font-size="10.5" font-weight="700" fill="{ANIM_MUTED}"
+            style="text-transform:uppercase;letter-spacing:0.06em">Channels</text>
+      <text x="{KQV_X-32}" y="{KEY_Y-12}" font-size="11.5" font-weight="700" fill="{KEY_COL}"
+            class="lbl lane-car-lbl">CAR</text>
+      <text x="{KQV_X-52}" y="{QUERY_Y-12}" font-size="11.5" font-weight="700" fill="{QUERY_COL}"
+            class="lbl lane-bandpass-lbl">Bandpass</text>
+      <text x="{KQV_X-40}" y="{VALUE_Y+24}" font-size="11.5" font-weight="700" fill="{VALUE_COL}"
+            class="lbl lane-cspvar-lbl">CSP var</text>
+
+      {''.join(ribbons_in)}
+      {''.join(ch_dots)}
+
+      <path id="path-car" d="{key_to_grid}" stroke="{KEY_COL}" stroke-width="2.2" fill="none"
+            opacity="0.45" class="ribbon"/>
+      <path id="path-bandpass" d="{query_to_grid}" stroke="{QUERY_COL}" stroke-width="2.2" fill="none"
+            opacity="0.45" class="ribbon"/>
+      <path id="path-cspvar" d="{value_to_out}" stroke="{VALUE_COL}" stroke-width="2.2" fill="none"
+            opacity="0.45" class="ribbon"/>
+
+      <g id="csp-grid">
+        <rect x="{GRID_X0}" y="{GRID_Y0}" width="{GRID_X1-GRID_X0}" height="{GRID_Y1-GRID_Y0}"
+              rx="12" fill="{ANIM_PANEL}" stroke="{ANIM_LINE}"/>
+        <text x="{(GRID_X0+GRID_X1)//2}" y="{GRID_Y0-8}" text-anchor="middle" font-size="11.5"
+              font-weight="700" fill="{ANIM_INK}">CSP projection</text>
+        {''.join(grid_dots)}
+        {band_labels}
+        <text x="{(GRID_X0+GRID_X1)//2}" y="{GRID_Y1+32}" text-anchor="middle" font-size="9.5"
+              fill="{ANIM_MUTED}">5 bands &times; 4 components</text>
+      </g>
+
+      <path id="path-logvar" d="{grid_to_out}" stroke="{ANIM_ACCENT}" stroke-width="2.2" fill="none"
+            opacity="0.45" class="ribbon"/>
+      <path id="logvar-arrow" d="M {OUT_X-13} {OUT_Y-22} L {OUT_X+13} {OUT_Y} L {OUT_X-13} {OUT_Y+22} Z"
+            fill="{ANIM_ACCENT}" opacity="0.25"/>
+      <text x="{OUT_X}" y="{OUT_Y-30}" text-anchor="middle" font-size="10.5" fill="{ANIM_MUTED}">Log-var</text>
+
+      <path id="path-svm-in" d="{out_to_svm}" stroke="{ANIM_ACCENT}" stroke-width="2.2" fill="none"
+            opacity="0.4" class="ribbon"/>
+      <path id="svm-shape" d="{svm_shape}" stroke="{ANIM_ACCENT}" stroke-width="2" fill="none" opacity="0.35"/>
+      <text x="{svm_mid}" y="{OUT_Y-68}" text-anchor="middle" font-size="11.5" font-weight="700"
+            fill="{ANIM_INK}">SVM</text>
+      <path id="path-final" d="{svm_to_final}" stroke="{result_color}" stroke-width="3" fill="none"
+            opacity="0.6" class="ribbon"/>
+      <circle id="final-dot" cx="{FINAL_X}" cy="{OUT_Y}" r="5" fill="{result_color}"/>
+    </svg>
+    """
+
+    prob_rows = ""
+    for name, val, is_top in ((pred_name, conf, True), (other_name, other_pct, False)):
+        col    = result_color if is_top else ANIM_MUTED
+        weight = 700 if is_top else 400
+        prob_rows += f"""
+        <div class="prob-row">
+          <span style="color:{col};font-weight:{weight}">{name}</span>
+          <div class="prob-bar-track"><div class="prob-bar-fill" data-w="{val}" style="width:0%;background:{col}"></div></div>
+          <span style="color:{col};font-weight:{weight}">{val:.0f}%</span>
+        </div>"""
 
     return f"""
     <style>
-      .neuro-wrap {{
+      .neuro-wrap2 {{
         font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
         color: {ANIM_INK};
-        display: grid;
-        grid-template-columns: 230px 1fr 220px;
-        gap: 18px;
-        align-items: start;
+        display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap;
       }}
-      .neuro-card {{
-        background: {ANIM_PANEL};
-        border: 1px solid {ANIM_LINE};
-        border-radius: 14px;
-        padding: 14px 16px;
+      .svg-col {{ max-width: 1180px; flex: 1 1 700px; min-width: 280px; }}
+      .neuro-head {{
+        display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:4px;
+        font-size:13px; color:{ANIM_MUTED}; margin-bottom:4px;
       }}
-      .stage {{
-        display: flex; align-items: flex-start; gap: 10px;
-        padding: 7px 4px; border-radius: 8px; opacity: 0.35;
-        transition: opacity 0.35s ease, background 0.35s ease;
-      }}
-      .stage.active {{ opacity: 1; background: rgba(76,111,255,0.08); }}
-      .stage.done   {{ opacity: 0.75; }}
-      .dot {{
-        width: 9px; height: 9px; border-radius: 50%;
-        background: {ANIM_LINE}; margin-top: 5px; flex: none;
-        transition: background 0.3s ease, box-shadow 0.3s ease;
-      }}
-      .stage.active .dot {{
-        background: {ANIM_ACCENT};
-        box-shadow: 0 0 0 4px rgba(76,111,255,0.18);
-      }}
-      .stage.done .dot {{ background: {ANIM_ACCENT_2}; }}
-      .stage-title {{ font-size: 12.5px; font-weight: 600; line-height: 1.3; }}
-      .stage-desc  {{ font-size: 10.5px; color: {ANIM_MUTED}; line-height: 1.35; margin-top: 1px; }}
-
-      .stage-panel-title {{
-        font-size: 11px; font-weight: 700; letter-spacing: 0.06em;
-        text-transform: uppercase; color: {ANIM_MUTED}; margin-bottom: 8px;
-      }}
-
-      .center-panel {{ display:flex; flex-direction:column; align-items:center; gap:10px; }}
       .flow-caption {{
-        font-size: 12px; color: {ANIM_MUTED}; text-align:center; min-height: 16px;
+        font-size:13px; color:{ANIM_ACCENT}; min-height:18px; margin-bottom:4px; font-weight:600;
       }}
-
-      .band-row {{ display:flex; align-items:center; gap:8px; margin:6px 0; }}
-      .band-label {{ font-size: 10.5px; width: 42px; color:{ANIM_MUTED}; text-transform:capitalize; }}
-      .band-track {{ flex:1; height:7px; background:{ANIM_LINE}; border-radius:4px; overflow:hidden; }}
-      .band-fill {{ height:100%; background:{ANIM_ACCENT}; border-radius:4px;
-                    transition: width 1s ease; }}
-
-      .result-card {{
-        margin-top: 12px; border-radius: 12px; padding: 14px;
-        background: {result_color}14; border: 1px solid {result_color}55;
-        text-align: center; opacity: 0; transform: translateY(6px);
+      .ribbon {{ stroke-dasharray: 6 5; animation: flow 1.6s linear infinite; }}
+      @keyframes flow {{ to {{ stroke-dashoffset: -22; }} }}
+      .ribbon.hi {{ opacity: 0.95 !important; stroke-width: 3.4; filter: drop-shadow(0 0 3px currentColor); }}
+      .lbl {{ opacity: 0.55; transition: opacity 0.25s ease; }}
+      .lbl.hi {{ opacity: 1; }}
+      #csp-grid {{ opacity: 0.5; transition: opacity 0.3s ease; }}
+      #csp-grid.hi {{ opacity: 1; }}
+      .grid-dot {{ transition: r 0.25s ease; }}
+      #csp-grid.hi .grid-dot-top {{ r: 8.5; }}
+      #svm-shape {{ transition: opacity 0.3s ease, stroke-width 0.3s ease; }}
+      #svm-shape.hi {{ opacity: 0.9; stroke-width: 3; }}
+      .ch-dot {{ transition: fill 0.2s ease, opacity 0.2s ease; }}
+      .prob-panel {{
+        background:{ANIM_PANEL}; border:1px solid {ANIM_LINE}; border-radius:16px; padding:20px 22px;
+        flex: 0 0 280px; opacity: 0; transform: translateY(6px);
         transition: opacity 0.5s ease, transform 0.5s ease;
       }}
-      .result-card.show {{ opacity: 1; transform: translateY(0); }}
-      .result-word {{ font-size: 22px; font-weight: 700; color: {result_color}; }}
-      .result-sub  {{ font-size: 11px; color: {ANIM_MUTED}; margin-top: 2px; }}
-      .result-tag  {{
-        display:inline-block; margin-top:8px; font-size:10.5px; font-weight:600;
-        padding:2px 8px; border-radius:20px;
-        color: {ANIM_SUCCESS if correct else "#B3261E"};
-        background: {ANIM_SUCCESS + "1A" if correct else "#B3261E1A"};
+      .prob-panel.show {{ opacity: 1; transform: translateY(0); }}
+      .prob-panel-title {{
+        font-size:12px; font-weight:700; text-transform:uppercase;
+        letter-spacing:0.06em; color:{ANIM_MUTED}; margin-bottom:14px;
       }}
+      .prob-row {{ display:flex; align-items:center; gap:10px; font-size:14px; margin:13px 0; }}
+      .prob-row span:first-child {{ width:118px; }}
+      .prob-row span:last-child  {{ width:42px; text-align:right; }}
+      .prob-bar-track {{ flex:1; height:8px; background:{ANIM_LINE}; border-radius:4px; overflow:hidden; }}
+      .prob-bar-fill  {{ height:100%; border-radius:4px; transition:width 0.9s ease; }}
+      .word-card {{
+        margin-top:18px; text-align:center; padding:14px; border-radius:12px;
+        background:{result_color}14; border:1px solid {result_color}55;
+      }}
+      .word-card .w {{ font-size:24px; font-weight:700; color:{result_color}; }}
+      .word-card .t {{ font-size:12.5px; color:{ANIM_MUTED}; margin-top:4px; }}
     </style>
-
-    <div class="neuro-wrap">
-
-      <div class="neuro-card">
-        <div class="stage-panel-title">Pipeline</div>
-        {stage_dots}
-      </div>
-
-      <div class="neuro-card center-panel">
-        <div class="stage-panel-title" style="align-self:flex-start">Signal capture</div>
-        <svg viewBox="0 0 320 230" style="width:100%;max-width:320px">
-          <ellipse cx="160" cy="118" rx="86" ry="100" fill="none" stroke="{ANIM_LINE}" stroke-width="2"/>
-          <path d="M 78 82 A 86 100 0 0 1 242 82" fill="none" stroke="{ANIM_LINE}" stroke-width="2"/>
-          <g id="electrodes"></g>
-          <g id="signal-line" opacity="0">
-            <path id="wave-path" d="M 40 200 q 10 -18 20 0 q 10 18 20 0 q 10 -18 20 0 q 10 18 20 0"
-                  fill="none" stroke="{ANIM_ACCENT}" stroke-width="2"/>
-          </g>
-        </svg>
-        <div class="flow-caption" id="flow-caption">Positioning electrodes…</div>
-      </div>
-
-      <div class="neuro-card">
-        <div class="stage-panel-title">Band power</div>
-        <div id="band-container">{band_bars if band_bars else '<div style="font-size:11px;color:' + ANIM_MUTED + '">Computed after CSP…</div>'}</div>
-        <div class="result-card" id="result-card">
-          <div class="result-word" id="result-word">{word}</div>
-          <div class="result-sub">{BINARY_NAMES[pred_label]}</div>
-          <div class="result-tag">{"&#10003; Matches true label" if correct else "&#10007; Differs from true label"}</div>
+    <div class="neuro-head">
+      <span>Trial pipeline &middot; imagined word &ldquo;{word}&rdquo;</span>
+      <span>5 frequency bands &middot; per-subject CSP</span>
+    </div>
+    <div class="flow-caption" id="flow-caption">Positioning electrodes&hellip;</div>
+    <div class="neuro-wrap2">
+      <div class="svg-col">{svg}</div>
+      <div class="prob-panel" id="prob-panel">
+        <div class="prob-panel-title">Prediction</div>
+        {prob_rows}
+        <div class="word-card">
+          <div class="w">{pred_name}</div>
+          <div class="t">{"&#10003; matches true label" if correct else "&#10007; differs from true label"}</div>
         </div>
       </div>
-
     </div>
 
     <script>
     (function() {{
-      const stages = {json.dumps([{"t": t, "d": d} for t, d in stages_json])};
-      const positions = [[160,44],[196,50],[124,50],[220,68],[100,68],
-                          [232,96],[88,96],[220,128],[100,128],[160,150]];
-      const eg = document.getElementById('electrodes');
-      positions.forEach((p,i)=>{{
-        const c = document.createElementNS("http://www.w3.org/2000/svg","circle");
-        c.setAttribute("cx",p[0]); c.setAttribute("cy",p[1]); c.setAttribute("r",5.5);
-        c.setAttribute("fill","#FFFFFF"); c.setAttribute("stroke","{ANIM_LINE}");
-        c.setAttribute("stroke-width","2"); c.setAttribute("id","e"+i);
-        eg.appendChild(c);
-      }});
-
-      const STEP_MS = 480;
+      const stages = {json.dumps([{"t": t, "d": d} for t, d in ANIM_STAGE_INFO])};
+      const STEP_MS = 460;
+      const chDots = Array.from(document.querySelectorAll('.ch-dot'));
+      const accent = "{ANIM_ACCENT}";
       let i = 0;
 
+      function clearHi() {{
+        document.querySelectorAll('.hi').forEach(function(el) {{ el.classList.remove('hi'); }});
+      }}
+
       function setStage(idx) {{
-        for (let k=0; k<10; k++) {{
-          const el = document.getElementById('stage-'+k);
-          if (!el) continue;
-          el.classList.remove('active');
-          if (k < idx) el.classList.add('done'); else el.classList.remove('done');
-          if (k === idx) el.classList.add('active');
-        }}
         const capt = document.getElementById('flow-caption');
         if (stages[idx]) capt.textContent = stages[idx].d;
+        clearHi();
+
+        if (idx === 0 || idx === 1) {{
+          chDots.forEach(function(el, k) {{
+            setTimeout(function() {{
+              el.setAttribute('fill', accent);
+              el.setAttribute('opacity', '1');
+              setTimeout(function() {{
+                el.setAttribute('fill', '{ANIM_INK}');
+                el.setAttribute('opacity', '0.5');
+              }}, 220);
+            }}, k * 30);
+          }});
+        }}
+        if (idx === 2) {{
+          document.querySelectorAll('.lane-car, .lane-car-lbl, #path-car')
+            .forEach(function(el) {{ el.classList.add('hi'); }});
+        }}
+        if (idx === 4 || idx === 5) {{
+          document.querySelectorAll('.lane-bandpass, .lane-bandpass-lbl, #path-bandpass')
+            .forEach(function(el) {{ el.classList.add('hi'); }});
+          if (idx === 5) document.getElementById('csp-grid').classList.add('hi');
+        }}
+        if (idx === 6) {{
+          document.querySelectorAll('.lane-cspvar, .lane-cspvar-lbl, #path-cspvar')
+            .forEach(function(el) {{ el.classList.add('hi'); }});
+          document.getElementById('csp-grid').classList.add('hi');
+        }}
+        if (idx === 7) {{
+          document.querySelectorAll('#path-logvar, #path-svm-in').forEach(function(el) {{
+            el.classList.add('hi');
+          }});
+        }}
+        if (idx === 8) {{
+          document.getElementById('svm-shape').classList.add('hi');
+          document.getElementById('path-final').classList.add('hi');
+        }}
+        if (idx === 9) {{
+          document.getElementById('path-final').classList.add('hi');
+          const panel = document.getElementById('prob-panel');
+          panel.classList.add('show');
+          panel.querySelectorAll('.prob-bar-fill').forEach(function(el) {{
+            el.style.width = el.getAttribute('data-w') + '%';
+          }});
+        }}
       }}
 
       function tick() {{
-        if (i >= 10) return;
+        if (i >= stages.length) return;
         setStage(i);
-
-        if (i === 0) {{
-          positions.forEach((p, k) => {{
-            setTimeout(() => {{
-              const el = document.getElementById('e'+k);
-              el.setAttribute("fill", "{ANIM_ACCENT}");
-              setTimeout(() => el.setAttribute("fill", "#FFFFFF"), 200);
-            }}, k * 35);
-          }});
-        }}
-        if (i === 5) {{
-          document.getElementById('signal-line').setAttribute('opacity', '1');
-        }}
-        if (i === 9) {{
-          setTimeout(() => {{
-            document.getElementById('result-card').classList.add('show');
-          }}, 150);
-        }}
-
         i += 1;
         setTimeout(tick, STEP_MS);
       }}
@@ -926,13 +1085,112 @@ def build_video_capture_html(video_b64: str, mime: str = "video/mp4",
 
 
 # =============================================================================
+# VOICE OUTPUT — decoded word -> sentence (API) -> speech (edge-tts)
+# =============================================================================
+#
+#   decoded word "Hello"
+#        -> Anthropic API writes a short natural sentence using that word
+#           e.g. "Hello, how are you today?"
+#        -> edge-tts synthesises that sentence to speech (MP3 bytes)
+#        -> st.audio plays it in the UI
+#
+# Only 5 distinct words exist in this dataset, so results are cached per
+# word — repeats (very common across trials / Demo Mode) cost no extra
+# API calls or TTS synthesis.
+# =============================================================================
+
+EDGE_TTS_VOICE = "en-US-AriaNeural"   # any voice from `edge-tts --list-voices`
+
+# Used when no API key is supplied, the anthropic SDK isn't installed, or
+# the API call fails for any reason — the demo should never break because
+# of this feature.
+FALLBACK_SENTENCES = {
+    "Hello":    "Hello, how are you today?",
+    "Helpme":   "Please, can you help me right now?",
+    "Stop":     "Stop, please wait just a moment.",
+    "Thankyou": "Thank you so much for your help.",
+    "Yes":      "Yes, that sounds good to me.",
+}
+
+
+def generate_sentence_from_word(word: str, api_key: str) -> str:
+    """
+    Calls the Anthropic API to turn a single decoded word into one short,
+    natural spoken sentence that uses that word, e.g. "Hello" -> "Hello,
+    how are you?". Falls back to a canned sentence if no key / SDK /
+    network is available.
+    """
+    if not api_key or not ANTHROPIC_AVAILABLE:
+        return FALLBACK_SENTENCES.get(word, word)
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=40,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f'The word "{word}" was just decoded from imagined '
+                    f'speech on a BCI. Write ONE short, natural spoken '
+                    f'sentence (under 12 words) that a person might say, '
+                    f'using the word "{word}" naturally in it. Reply with '
+                    f'ONLY the sentence — no quotes, no preamble.'
+                ),
+            }],
+        )
+        text = "".join(
+            block.text for block in resp.content
+            if getattr(block, "type", "") == "text"
+        ).strip()
+        return text or FALLBACK_SENTENCES.get(word, word)
+    except Exception:
+        return FALLBACK_SENTENCES.get(word, word)
+
+
+async def _edge_tts_bytes(text: str, voice: str) -> bytes:
+    communicate = edge_tts.Communicate(text, voice)
+    buf = io.BytesIO()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            buf.write(chunk["data"])
+    return buf.getvalue()
+
+
+def synthesize_speech(text: str, voice: str = EDGE_TTS_VOICE) -> Optional[bytes]:
+    """Runs edge-tts synchronously and returns MP3 bytes, or None on failure."""
+    if not EDGE_TTS_AVAILABLE or not text:
+        return None
+    try:
+        return asyncio.run(_edge_tts_bytes(text, voice))
+    except Exception:
+        return None
+
+
+def get_sentence_and_audio(word: str, api_key: str, voice: str):
+    """
+    Cached word -> (sentence, audio_bytes) lookup, stored in session state
+    so reruns / repeated words (Demo Mode, Run All) don't re-call the API
+    or re-synthesise audio unnecessarily.
+    """
+    cache = st.session_state.setdefault("voice_cache", {})
+    key = (word, voice)
+    if key in cache:
+        return cache[key]
+    sentence = generate_sentence_from_word(word, api_key)
+    audio    = synthesize_speech(sentence, voice)
+    cache[key] = (sentence, audio)
+    return sentence, audio
+
+
+# =============================================================================
 # SESSION STATE
 # =============================================================================
 
 STATE_KEYS = [
     "idx", "history", "last_pred", "last_score", "last_true",
     "last_word", "last_eeg", "stage_idx", "artefact",
-    "last_band_powers", "demo_running",
+    "last_band_powers", "demo_running", "voice_cache",
 ]
 
 def reset_state():
@@ -1140,6 +1398,253 @@ articulatory motor planning literature.
 
 
 # =============================================================================
+# EEG AUTHENTICATION GATE — ported from auth_streamlit.py
+# =============================================================================
+# A login screen that uses a person's EEG brainwave as a biometric, gating
+# access to the simulation dashboard below. Uses authentication.py's own
+# enrolled subject model (auth_artifacts/subject_model.pkl), which is a
+# separate model from the per-subject CSP+SVM models used by the simulation
+# itself — run `python authentication.py self-test` (or `enroll`) once to
+# produce it.
+
+def load_auth_models():
+    """Load the saved authenticator + word predictor for the login gate."""
+    auth = None
+    wp = None
+    if SUBJECT_MODEL_PATH.exists():
+        with open(SUBJECT_MODEL_PATH, "rb") as fh:
+            auth = pickle.load(fh)["auth"]
+    if WORD_MODEL_PATH.exists():
+        with open(WORD_MODEL_PATH, "rb") as fh:
+            wp = pickle.load(fh)
+    return auth, wp
+
+
+def load_auth_eer():
+    if EER_PATH.exists():
+        with open(EER_PATH) as fh:
+            return json.load(fh)
+    return None
+
+
+def auth_result_card_html(res, word=None, true_word=None):
+    if res["granted"]:
+        color, icon, status = COL_GREEN, "&#10003;", "ACCESS GRANTED"
+    else:
+        color, icon, status = COL_RED, "&#10007;", "ACCESS DENIED"
+
+    score = res["score"]
+    thr   = res["threshold"]
+    conf  = res["confidence"]
+
+    max_abs = max(abs(score), abs(thr), 1.0) * 1.2
+    bar = max(0.0, min(100.0, (score + max_abs) / (2 * max_abs) * 100))
+
+    word_html = ""
+    if res["granted"] and word is not None:
+        word_html = f"""
+        <div style="margin-top:16px;border-top:1px solid #ddd;padding-top:12px">
+            <div style="font-size:12px;color:{COL_GRAY};text-transform:uppercase;
+                        letter-spacing:1px">Predicted imagined word</div>
+            <div style="font-size:34px;font-weight:500;color:{COL_BLUE};margin-top:4px">
+                {word}
+            </div>
+            <div style="font-size:12px;color:{COL_GRAY}">
+                True word: {true_word or '?'}
+            </div>
+        </div>
+        """
+    elif not res["granted"]:
+        word_html = f"""
+        <div style="margin-top:16px;border-top:1px solid #ddd;padding-top:12px;
+                    color:{COL_GRAY};font-size:13px;font-style:italic">
+            &#128274; Word prediction locked — authentication failed.
+        </div>
+        """
+
+    return f"""
+    <div style="border:2px solid {color};border-radius:12px;padding:24px;
+                text-align:center;background:{color}18">
+        <div style="font-size:14px;color:{COL_GRAY};text-transform:uppercase;
+                    letter-spacing:1px">Authentication result</div>
+        <div style="font-size:30px;font-weight:500;color:{color};margin-top:6px">
+            {icon} {status}
+        </div>
+        <div style="font-size:13px;color:{COL_GRAY};margin-top:4px">
+            Claimed subject: <strong>{res['subject']}</strong>
+        </div>
+        <div style="margin:14px auto 0;max-width:260px">
+            <div style="display:flex;justify-content:space-between;font-size:11px;
+                        color:{COL_GRAY}">
+                <span>Score {score:.3f}</span>
+                <span>Threshold {thr:.3f}</span>
+            </div>
+            <div style="background:#eee;border-radius:4px;height:8px;margin-top:4px">
+                <div style="background:{color};height:8px;border-radius:4px;
+                            width:{bar:.1f}%"></div>
+            </div>
+        </div>
+        <div style="font-size:12px;color:{COL_GRAY};margin-top:8px">
+            Confidence proxy: {conf:.1f}%
+        </div>
+        {word_html}
+    </div>
+    """
+
+
+def render_auth_gate():
+    """
+    Full-page EEG login gate. Returns True once the person has been granted
+    access in this session (and the dashboard below should render); False
+    while the gate itself is still on screen.
+    """
+    st.markdown(
+        "<h2 style='margin-bottom:2px'>&#128274; BCI EEG Authentication Gate</h2>"
+        "<p style='color:#73726c;font-size:13px;margin-top:0'>"
+        "Biometric brainwave login &middot; GRANTED &rarr; enter simulation "
+        "&middot; DENIED &rarr; locked</p>",
+        unsafe_allow_html=True,
+    )
+    st.divider()
+
+    if not AUTH_MODULE_AVAILABLE:
+        st.error(
+            "`authentication.py` wasn't found next to this script. Place it "
+            "in the same folder and reload."
+        )
+        st.stop()
+
+    auth, wp = load_auth_models()
+    eer = load_auth_eer()
+
+    if auth is None:
+        st.warning(
+            "No enrolled subject model found. Run one of:\n\n"
+            "`python authentication.py enroll --path <dataset_root>`\n\n"
+            "or\n\n"
+            "`python authentication.py self-test`\n\n"
+            "then reload this page."
+        )
+        st.stop()
+
+    dataset_root = auth_discover_dataset()
+    mat_map = auth_discover_mat_files(dataset_root) if dataset_root is not None else None
+    threshold = auth.threshold if auth.threshold is not None else 0.0
+
+    with st.sidebar:
+        st.markdown("### Dataset")
+        if dataset_root is not None:
+            st.success(f"Found: `{dataset_root}`")
+        else:
+            st.info("Dataset not auto-found.")
+
+        subjects = sorted(mat_map.keys()) if mat_map else (
+            sorted(auth.classes_) if auth.classes_ else []
+        )
+
+        st.markdown("### Claimed identity")
+        subject   = st.selectbox("Subject", subjects, key="auth_subject_select")
+        split     = st.selectbox("Split", ["val", "train", "test"], key="auth_split_select")
+        trial_idx = st.number_input("Trial index", min_value=0, value=0, step=1,
+                                     key="auth_trial_select")
+
+        st.markdown("### System")
+        st.metric("Threshold", f"{threshold:.3f}")
+        if eer:
+            st.metric("EER (validation)", f"{eer['eer']*100:.2f}%")
+        st.caption("EER = Equal-Error-Rate. Lower is better.")
+
+        st.divider()
+        st.markdown("""
+**Classes:** Hello, Helpme, Stop, Thankyou, Yes
+
+**Who is enrolled?** Only subjects used in enrollment can be recognised.
+A subject not in the set will always be **DENIED**.
+""")
+
+    left, right = st.columns([3, 2], gap="large")
+
+    F, true_word = None, None
+    with left:
+        st.markdown("""
+### How this works
+Each person's EEG is unique — a **"brainprint"**. This gate uses a single
+trial to verify a claimed identity:
+
+1. **CAR** spatial filtering removes common noise.
+2. **Epoch trim** keeps the post-stimulus window.
+3. **Hanning taper + 5-band bandpass** isolates theta/mu/beta/gamma rhythms.
+4. **Per-channel log band-power + broadband log-variance** form the subject
+   fingerprint.
+5. A one-vs-rest **SVM** scores the trial against every enrolled subject.
+6. If the score **≥ threshold** → **GRANTED** and the simulation unlocks.
+   Otherwise → **DENIED**.
+""")
+
+        if mat_map is None or subject not in mat_map:
+            st.error("No dataset/mat files for this subject.")
+        else:
+            fpaths = mat_map[subject].get(split) or mat_map[subject].get("train")
+            if not fpaths:
+                st.error(f"No {split} data for {subject}.")
+            else:
+                fpath = fpaths[0]
+                epo_key = {"train": "epo_train", "val": "epo_validation",
+                           "test": "epo_test"}[split]
+                try:
+                    X, y = auth_load_epoch(fpath, epo_key)
+                    n_trials = X.shape[0]
+                    trial_idx = int(min(trial_idx, n_trials - 1))
+                    trial_X = X[trial_idx: trial_idx + 1]
+                    F = extract_subject_features(trial_X)
+                    true_word = CLASS_NAMES.get(int(y[trial_idx]), "?")
+                    st.caption(f"Trial {trial_idx}/{n_trials-1} · true word: {true_word}")
+                except Exception as e:
+                    st.error(f"Load error: {e}")
+                    F = None
+
+    granted_now = False
+    with right:
+        st.markdown("**Authentication**")
+        if F is not None:
+            res = auth.authenticate(F, subject)
+            word = None
+            if res["granted"] and wp is not None:
+                _, wname = wp.predict(F, subject)
+                word = wname
+            st.markdown(auth_result_card_html(res, word, true_word),
+                        unsafe_allow_html=True)
+
+            if res["granted"]:
+                granted_now = True
+                if st.button("Enter simulation \u2192", type="primary",
+                             use_container_width=True):
+                    st.session_state.authenticated  = True
+                    st.session_state.auth_subject    = subject
+                    st.rerun()
+            else:
+                st.button("Enter simulation \u2192", disabled=True,
+                          use_container_width=True,
+                          help="Authentication must succeed first.")
+        else:
+            st.markdown(
+                "<div style='color:#73726c;font-size:13px;padding:40px 20px;"
+                "text-align:center;border:1px dashed #D3D1C7;border-radius:10px'>"
+                "No trial data available for authentication.</div>",
+                unsafe_allow_html=True,
+            )
+
+    st.divider()
+    st.markdown("""
+**Note:** If the dataset isn't present on this machine, run
+`python authentication.py self-test` to generate synthetic enrolled subjects,
+then reload. Any subject in the synthetic set will be granted; an
+out-of-set subject will be denied.
+""")
+    return granted_now
+
+
+# =============================================================================
 # MAIN APP
 # =============================================================================
 
@@ -1149,6 +1654,25 @@ def main():
         page_icon="🧠",
         layout="wide",
     )
+
+    # ── EEG authentication gate ──────────────────────────────────────────
+    # The dashboard below (Normal / Video / Animated modes, voice output,
+    # everything) is unchanged and only unlocks once the person's EEG trial
+    # is verified against an enrolled subject model.
+    st.session_state.setdefault("authenticated", False)
+    st.session_state.setdefault("auth_subject", None)
+
+    if not st.session_state.authenticated:
+        render_auth_gate()
+        return
+
+    with st.sidebar:
+        st.success(f"🔓 Authenticated as **{st.session_state.auth_subject}**")
+        if st.button("Log out", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state.auth_subject  = None
+            st.rerun()
+        st.divider()
 
     st.markdown(
         "<h2 style='margin-bottom:2px'>🧠 BCI Imagined Speech — Simulation</h2>"
@@ -1208,6 +1732,27 @@ def main():
             min_value=0.5, max_value=5.0,
             value=2.0, step=0.5,
         )
+
+        st.divider()
+        st.markdown("### Voice output")
+        enable_voice = st.checkbox(
+            "Speak decoded word as a sentence",
+            value=False,
+            help="Word -> API generates a sentence -> edge-tts speaks it.",
+        )
+        tts_api_key = st.text_input(
+            "Anthropic API key",
+            value=os.environ.get("ANTHROPIC_API_KEY", ""),
+            type="password",
+            help="Leave blank to use built-in fallback sentences.",
+        )
+        if enable_voice and not EDGE_TTS_AVAILABLE:
+            st.warning("`edge-tts` not installed — run `pip install edge-tts`.")
+        if enable_voice and not ANTHROPIC_AVAILABLE:
+            st.caption(
+                "`anthropic` not installed — using fallback sentences. "
+                "Run `pip install anthropic` for real API sentences."
+            )
 
         st.divider()
         st.markdown("""
@@ -1362,48 +1907,54 @@ def main():
                 pred_label=st.session_state.last_pred,
                 true_label=st.session_state.last_true,
                 band_powers=st.session_state.last_band_powers,
+                dec_score=st.session_state.last_score,
             )
             with anim_ph:
-                components.html(html, height=430, scrolling=False)
+                components.html(html, height=560, scrolling=False)
         else:
             anim_ph.info("Click Next Trial to run the animation.")
 
     with right:
-        st.markdown("**Result**")
-        result_ph = st.empty()
-        if st.session_state.last_pred is not None and not is_anim:
-            # Animated illustration mode already shows its own result card,
-            # so avoid duplicating it here.
-            result_ph.markdown(
-                result_card_html(
-                    st.session_state.last_pred,
-                    st.session_state.last_true,
-                    st.session_state.last_score,
-                    st.session_state.last_word,
-                    st.session_state.artefact,
-                ),
-                unsafe_allow_html=True,
-            )
-        elif is_anim and st.session_state.last_pred is not None:
-            result_ph.markdown(
-                result_card_html(
-                    st.session_state.last_pred,
-                    st.session_state.last_true,
-                    st.session_state.last_score,
-                    st.session_state.last_word,
-                    st.session_state.artefact,
-                ),
-                unsafe_allow_html=True,
-            )
+        if not is_anim:
+            st.markdown("**Result**")
+            result_ph = st.empty()
+            if st.session_state.last_pred is not None:
+                result_ph.markdown(
+                    result_card_html(
+                        st.session_state.last_pred,
+                        st.session_state.last_true,
+                        st.session_state.last_score,
+                        st.session_state.last_word,
+                        st.session_state.artefact,
+                    ),
+                    unsafe_allow_html=True,
+                )
+            else:
+                result_ph.markdown(
+                    "<div style='color:#73726c;font-size:13px;"
+                    "padding:40px 20px;text-align:center;"
+                    "border:1px dashed #D3D1C7;border-radius:10px'>"
+                    "Press a button below to begin."
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
         else:
-            result_ph.markdown(
-                "<div style='color:#73726c;font-size:13px;"
-                "padding:40px 20px;text-align:center;"
-                "border:1px dashed #D3D1C7;border-radius:10px'>"
-                "Press a button below to begin."
-                "</div>",
-                unsafe_allow_html=True,
+            # The Animated illustration widget renders its own prediction
+            # panel inline, so nothing is duplicated here. result_ph still
+            # needs to exist (Demo Mode refreshes it below) — make it a
+            # harmless no-op placeholder.
+            result_ph = st.empty()
+
+        # ── Voice output: word -> sentence (API) -> speech (edge-tts) ──────
+        if enable_voice and st.session_state.last_word:
+            sentence, audio = get_sentence_and_audio(
+                st.session_state.last_word, tts_api_key, EDGE_TTS_VOICE,
             )
+            st.caption(f'🗣️ "{sentence}"')
+            if audio:
+                st.audio(audio, format="audio/mp3")
+            elif EDGE_TTS_AVAILABLE:
+                st.caption("Voice synthesis failed for this trial.")
 
     st.divider()
 
@@ -1513,20 +2064,22 @@ def main():
                 pred_label=st.session_state.last_pred,
                 true_label=st.session_state.last_true,
                 band_powers=st.session_state.last_band_powers,
+                dec_score=st.session_state.last_score,
             )
             with anim_ph:
-                components.html(html, height=430, scrolling=False)
+                components.html(html, height=560, scrolling=False)
 
-        result_ph.markdown(
-            result_card_html(
-                st.session_state.last_pred,
-                st.session_state.last_true,
-                st.session_state.last_score,
-                st.session_state.last_word,
-                st.session_state.artefact,
-            ),
-            unsafe_allow_html=True,
-        )
+        if not is_anim:
+            result_ph.markdown(
+                result_card_html(
+                    st.session_state.last_pred,
+                    st.session_state.last_true,
+                    st.session_state.last_score,
+                    st.session_state.last_word,
+                    st.session_state.artefact,
+                ),
+                unsafe_allow_html=True,
+            )
 
         time.sleep(demo_delay)
 
